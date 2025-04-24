@@ -1,0 +1,7 @@
+openai-whisper
+yt-dlp
+pydub
+tqdm
+edge-tts
+numpy
+ffmpeg

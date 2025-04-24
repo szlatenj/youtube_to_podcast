@@ -6,12 +6,68 @@ import json
 import asyncio
 import whisper
 import numpy as np
+import torch
 from yt_dlp import YoutubeDL
 from pydub import AudioSegment
 from tqdm import tqdm
 import edge_tts
 import tempfile
-import re 
+import re
+from datasets import Dataset
+
+# Check if CUDA is available
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if DEVICE == "cuda":
+    print("GPU acceleration enabled!")
+    torch.cuda.empty_cache()  # Clear GPU memory before starting
+else:
+    print("Running on CPU. Install CUDA for faster processing.")
+
+# Dictionary of supported languages with their codes
+LANGUAGES = {
+    "Afrikaans": "af", "Arabic": "ar", "Armenian": "hy", "Azerbaijani": "az",
+    "Belarusian": "be", "Bosnian": "bs", "Bulgarian": "bg", "Catalan": "ca",
+    "Chinese": "zh", "Croatian": "hr", "Czech": "cs", "Danish": "da",
+    "Dutch": "nl", "English": "en", "Estonian": "et", "Finnish": "fi",
+    "French": "fr", "Galician": "gl", "German": "de", "Greek": "el",
+    "Hebrew": "he", "Hindi": "hi", "Hungarian": "hu", "Icelandic": "is",
+    "Indonesian": "id", "Italian": "it", "Japanese": "ja", "Kannada": "kn",
+    "Kazakh": "kk", "Korean": "ko", "Latvian": "lv", "Lithuanian": "lt",
+    "Macedonian": "mk", "Malay": "ms", "Marathi": "mr", "Maori": "mi",
+    "Nepali": "ne", "Norwegian": "no", "Persian": "fa", "Polish": "pl",
+    "Portuguese": "pt", "Romanian": "ro", "Russian": "ru", "Serbian": "sr",
+    "Slovak": "sk", "Slovenian": "sl", "Spanish": "es", "Swahili": "sw",
+    "Swedish": "sv", "Tagalog": "tl", "Tamil": "ta", "Thai": "th",
+    "Turkish": "tr", "Ukrainian": "uk", "Urdu": "ur", "Vietnamese": "vi",
+    "Welsh": "cy"
+}
+
+# Edge TTS voices for different languages
+VOICES = {
+    "en": ["en-US-ChristopherNeural", "en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural"],
+    "es": ["es-ES-AlvaroNeural", "es-ES-ElviraNeural"],
+    "fr": ["fr-FR-HenriNeural", "fr-FR-DeniseNeural"],
+    "de": ["de-DE-ConradNeural", "de-DE-KatjaNeural"],
+    "it": ["it-IT-DiegoNeural", "it-IT-ElsaNeural"],
+    "ja": ["ja-JP-KeitaNeural", "ja-JP-NanamiNeural"],
+    "ko": ["ko-KR-InJoonNeural", "ko-KR-SunHiNeural"],
+    "zh": ["zh-CN-YunxiNeural", "zh-CN-XiaoxiaoNeural"],
+    "ru": ["ru-RU-DmitryNeural", "ru-RU-SvetlanaNeural"],
+    "pt": ["pt-BR-AntonioNeural", "pt-BR-FranciscaNeural"],
+    "hu": ["hu-HU-TamasNeural", "hu-HU-NoemiNeural"],  # Hungarian voices
+    # Default fallback for other languages
+    "default": ["en-US-ChristopherNeural", "en-US-JennyNeural"]
+}
+
+def get_voices_for_language(lang_code):
+    """Get appropriate voices for a language"""
+    return VOICES.get(lang_code.split('-')[0], VOICES["default"])
+
+def list_languages():
+    """Print available languages and their codes"""
+    print("\nAvailable languages:")
+    for name, code in sorted(LANGUAGES.items()):
+        print(f"{name}: {code}")
 
 def find_ffmpeg_windows():
     """Try to find ffmpeg in common Windows locations"""
@@ -91,15 +147,10 @@ def extract_speaker_segments(text):
     
     return segments
 
-def process_audio_segments(segments, base_output_path):
+def process_audio_segments(segments, base_output_path, target_lang):
     """Process audio segments with different voices for each speaker"""
-    # Available voices for different speakers
-    voices = {
-        "Speaker 1": "en-US-ChristopherNeural",  # Male voice
-        "Speaker 2": "en-US-JennyNeural",        # Female voice
-        "Speaker 3": "en-US-GuyNeural",          # Alternative male voice
-        "Speaker 4": "en-US-AriaNeural",         # Alternative female voice
-    }
+    # Get appropriate voices for the target language
+    voices = get_voices_for_language(target_lang)
     
     # Create a temporary directory for audio segments
     temp_dir = tempfile.mkdtemp()
@@ -108,7 +159,7 @@ def process_audio_segments(segments, base_output_path):
     # Process each segment
     for i, segment in enumerate(segments):
         speaker = segment["speaker"]
-        voice = voices.get(speaker, voices["Speaker 1"])
+        voice = voices[i % len(voices)]  # Alternate between available voices
         
         # Generate speech for the segment
         temp_file = os.path.join(temp_dir, f"segment_{i}.mp3")
@@ -131,33 +182,78 @@ def process_audio_segments(segments, base_output_path):
     # Clean up temporary directory
     os.rmdir(temp_dir)
 
-def translate_audio(input_file, output_file, source_lang=None, model_name="medium"):
+def translate_audio(input_file, output_file, source_lang=None, target_lang="en", model_name="medium"):
     """Translate audio using Whisper and generate multi-speaker output"""
     print(f"Loading Whisper model: {model_name}")
-    model = whisper.load_model(model_name)
+    model = whisper.load_model(model_name, device=DEVICE)
     
-    print("Transcribing and translating audio...")
+    print(f"Translating audio to {target_lang}...")
+    # Directly use Whisper's translate task
     result = model.transcribe(
         input_file,
-        task="translate",
         language=source_lang,
-        verbose=True
+        task="translate",
+        verbose=True,
+        fp16=DEVICE == "cuda"  # Use half-precision on GPU
     )
+    
+    translated_text = result["text"]
+    
+    # If target language is not English, translate from English
+    if target_lang != "en":
+        try:
+            print(f"Converting English translation to {target_lang}...")
+            from transformers import pipeline
+            
+            # Create a dataset from the text chunks for batch processing
+            chunks = [translated_text[i:i+500] for i in range(0, len(translated_text), 500)]
+            dataset = Dataset.from_dict({"text": chunks})
+            
+            # Initialize translation pipeline
+            translator = pipeline("translation",
+                               model=f"Helsinki-NLP/opus-mt-en-{target_lang}",
+                               device=0 if DEVICE == "cuda" else -1,
+                               batch_size=8 if DEVICE == "cuda" else 1)
+            
+            # Translate in batches
+            print("Translating text chunks...")
+            translations = []
+            for batch in dataset.iter(batch_size=8):
+                if DEVICE == "cuda":
+                    torch.cuda.empty_cache()  # Clear GPU memory before each batch
+                batch_translations = translator(batch["text"])
+                translations.extend([t['translation_text'] for t in batch_translations])
+            
+            translated_text = " ".join(translations)
+            
+            # Save final translation
+            final_text_file = output_file.rsplit('.', 1)[0] + f'_translated.txt'
+            with open(final_text_file, 'w', encoding='utf-8') as f:
+                f.write(translated_text)
+            print(f"Translation saved to: {final_text_file}")
+            
+        except Exception as e:
+            print(f"Warning: Translation to {target_lang} failed. Error: {e}")
+            print("Falling back to English translation")
     
     # Extract speaker segments from the translation
     print("Processing speaker segments...")
-    segments = extract_speaker_segments(result["text"])
+    segments = extract_speaker_segments(translated_text)
+    
+    # Save segments with speaker information
+    segments_file = output_file.rsplit('.', 1)[0] + '_segments.json'
+    with open(segments_file, 'w', encoding='utf-8') as f:
+        json.dump(segments, f, indent=2, ensure_ascii=False)
+    print(f"Speaker segments saved to: {segments_file}")
     
     # Process segments and create final audio
     print("Generating translated audio with multiple voices...")
-    process_audio_segments(segments, output_file.rsplit('.', 1)[0])
+    process_audio_segments(segments, output_file.rsplit('.', 1)[0], target_lang)
     
-    # Save the translated text for reference
-    text_file = output_file.rsplit('.', 1)[0] + '.txt'
-    with open(text_file, 'w', encoding='utf-8') as f:
-        json.dump(segments, f, indent=2, ensure_ascii=False)
+    # Clear GPU memory after processing
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
     
-    print(f"Translation saved to: {text_file}")
     return segments
 
 def main():
@@ -166,10 +262,26 @@ def main():
     parser.add_argument('--output', '-o', help='Output directory', default='output')
     parser.add_argument('--model', '-m', help='Whisper model to use', default='medium',
                         choices=['tiny', 'base', 'small', 'medium', 'large'])
-    parser.add_argument('--source-lang', '-s', help='Source language (optional)')
+    parser.add_argument('--source-lang', '-s', help='Source language code (optional)')
+    parser.add_argument('--target-lang', '-t', help='Target language code (default: en)',
+                        default='en')
     parser.add_argument('--ffmpeg-path', help='Path to ffmpeg executable directory')
+    parser.add_argument('--list-languages', '-l', action='store_true',
+                        help='List available languages and exit')
     
     args = parser.parse_args()
+    
+    # Show available languages if requested
+    if args.list_languages:
+        list_languages()
+        return
+    
+    # Validate target language
+    target_lang = args.target_lang.lower()
+    if target_lang not in [code.lower() for code in LANGUAGES.values()]:
+        print(f"Error: Unsupported target language code: {target_lang}")
+        list_languages()
+        return
     
     # Create output directory if it doesn't exist
     os.makedirs(args.output, exist_ok=True)
@@ -206,6 +318,7 @@ def main():
         audio_output,
         audio_output,
         source_lang=args.source_lang,
+        target_lang=target_lang,
         model_name=args.model
     )
     
